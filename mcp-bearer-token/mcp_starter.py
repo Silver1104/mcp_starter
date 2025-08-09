@@ -656,224 +656,187 @@ async def job_finder(
 # ------------------------------------------------------------------
 # WhatsApp-compatible data analysis tool
 # ------------------------------------------------------------------
+def detect_file_type(file_bytes: bytes) -> str:
+    # XLSX (Office Open XML) files are ZIP archives starting with 'PK'
+    if file_bytes[:2] == b'PK':
+        return "xlsx"
+    # Simple check for binary Excel (.xls) - starts with D0 CF 11 E0
+    if file_bytes[:4] == b'\xD0\xCF\x11\xE0':
+        return "xls"
+    return "csv"  # default fallback
+
 @mcp.tool(description="Analyze CSV/Excel files uploaded via WhatsApp. Automatically detects file uploads and creates charts.")
 async def analyze_data_file(
-    # Multiple parameter names to catch different ways Puch might send file data
     file_data: Annotated[str, Field(description="Base64-encoded file data")] = None,
     puch_file_data: Annotated[str, Field(description="File data from Puch upload")] = None,
     data: Annotated[str, Field(description="Raw data content")] = None,
     content: Annotated[str, Field(description="File content")] = None,
-    # User's message
     message: Annotated[str, Field(description="User's analysis request")] = "analyze this data",
     user_message: Annotated[str, Field(description="What user said about the data")] = "analyze this data",
     query: Annotated[str, Field(description="User query")] = "analyze this data",
-    # File type detection
     file_type: Annotated[str, Field(description="csv or xlsx")] = "auto",
     filename: Annotated[str, Field(description="Original filename if available")] = None,
 ) -> List[TextContent | ImageContent]:
-    """
-    WhatsApp-compatible data analysis tool that tries multiple ways to find the uploaded file.
-    """
     try:
-        # Try to find the actual file data from multiple possible parameter names
+        # Detect file data from parameters
         actual_file_data = None
         for param in [file_data, puch_file_data, data, content]:
-            if param and len(param) > 100:  # Basic check for substantial data
+            if param and len(param) > 100:
                 actual_file_data = param
                 break
         
         if not actual_file_data:
-            # Return helpful debug info
-            debug_info = [
-                "🔍 Debug: No file data detected. Parameters received:",
-                f"file_data: {'✓ present' if file_data else '✗ missing'} ({len(file_data or '') if file_data else 0} chars)",
-                f"puch_file_data: {'✓ present' if puch_file_data else '✗ missing'} ({len(puch_file_data or '') if puch_file_data else 0} chars)",
-                f"data: {'✓ present' if data else '✗ missing'} ({len(data or '') if data else 0} chars)",
-                f"content: {'✓ present' if content else '✗ missing'} ({len(content or '') if content else 0} chars)",
-                "",
-                "💡 Try uploading the file again, or check if Puch is configured to send file uploads to this tool."
-            ]
-            return [TextContent(type="text", text="\n".join(debug_info))]
-        
-        # Get user's message
-        user_request = message or user_message or query or "analyze this data"
-        
-        # Auto-detect file type if not specified
-        if file_type == "auto" and filename:
-            if filename.lower().endswith('.xlsx'):
-                file_type = "xlsx"
-            elif filename.lower().endswith('.csv'):
-                file_type = "csv"
-        elif file_type == "auto":
-            file_type = "csv"  # default assumption
-        
-        # Decode the file
+            return [TextContent(type="text", text="❌ No file data detected. Please upload a CSV/XLSX file.")]
+
+        # Decode Base64
         try:
             file_bytes = base64.b64decode(actual_file_data)
         except Exception as e:
-            return [TextContent(type="text", text=f"❌ Could not decode file data: {str(e)}\nFirst 100 chars: {actual_file_data[:100]}")]
-        
+            return [TextContent(type="text", text=f"❌ Could not decode file data: {str(e)}")]
+
         buf = io.BytesIO(file_bytes)
-        
-        # Load dataframe
+
+        # Auto-detect file type if not specified
+        if file_type == "auto":
+            if filename:
+                if filename.lower().endswith('.xlsx'):
+                    file_type = "xlsx"
+                elif filename.lower().endswith('.csv'):
+                    file_type = "csv"
+                else:
+                    file_type = detect_file_type(file_bytes)
+            else:
+                file_type = detect_file_type(file_bytes)
+
+        # Load DataFrame
         df = None
         loading_method = ""
-        
+
         if file_type == "csv":
-            # Try multiple CSV loading approaches
-            approaches = [
+            # Try multiple CSV reading attempts
+            for method_name, kwargs in [
                 ("UTF-8, comma", {'encoding': 'utf-8', 'sep': ','}),
                 ("UTF-8, semicolon", {'encoding': 'utf-8', 'sep': ';'}),
                 ("UTF-8, tab", {'encoding': 'utf-8', 'sep': '\t'}),
                 ("Latin1, comma", {'encoding': 'latin1', 'sep': ','}),
                 ("Auto-detect", {'sep': None, 'engine': 'python'}),
-            ]
-            
-            for method_name, kwargs in approaches:
+            ]:
                 try:
                     buf.seek(0)
                     df = pd.read_csv(buf, **kwargs)
-                    if len(df.columns) > 1 and len(df) > 0:
+                    if len(df.columns) > 1 and not df.empty:
                         loading_method = method_name
                         break
-                except Exception as e:
-                    continue
-                    
-        else:  # xlsx
+                except:
+                    pass
+
+            # If CSV failed, try Excel fallback (misnamed file)
+            if df is None:
+                try:
+                    buf.seek(0)
+                    df = pd.read_excel(buf)
+                    loading_method = "Excel fallback (misnamed CSV)"
+                except:
+                    pass
+
+        elif file_type in ["xlsx", "xls"]:
             try:
                 buf.seek(0)
                 df = pd.read_excel(buf)
                 loading_method = "Excel"
-            except Exception as e:
-                return [TextContent(type="text", text=f"❌ Failed to read Excel file: {str(e)}")]
-        
+            except:
+                # Fallback to CSV read if Excel fails
+                try:
+                    buf.seek(0)
+                    df = pd.read_csv(buf)
+                    loading_method = "CSV fallback (misnamed Excel)"
+                except:
+                    pass
+
+        # If still failed
         if df is None or df.empty:
-            return [TextContent(type="text", text=f"❌ Could not load data. File size: {len(file_bytes)} bytes")]
-        
-        # Clean column names
+            return [TextContent(type="text", text="❌ Could not load file as CSV or Excel.")]
+
+        # Clean columns
         df.columns = df.columns.astype(str).str.strip()
-        
-        # Generate analysis
+
+        # Prepare summary
         n_rows, n_cols = df.shape
         numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
         text_cols = df.select_dtypes(include=['object']).columns.tolist()
-        
-        # Build comprehensive summary
-        summary_lines = [
-            f"📊 WhatsApp Data Analysis Complete!",
-            f"",
-            f"✅ Loaded successfully using: {loading_method}",
-            f"📈 Dataset: {n_rows:,} rows × {n_cols} columns",
-            f"🔢 Numeric columns: {len(numeric_cols)} ({', '.join(numeric_cols[:5])}{'...' if len(numeric_cols) > 5 else ''})",
-            f"📝 Text columns: {len(text_cols)} ({', '.join(text_cols[:5])}{'...' if len(text_cols) > 5 else ''})",
-            f"",
-            f"User request: '{user_request}'",
-            f""
+
+        summary = [
+            f"📊 Data Analysis Complete",
+            f"✅ Loaded with method: {loading_method}",
+            f"📈 Shape: {n_rows:,} rows × {n_cols} columns",
+            f"🔢 Numeric columns: {len(numeric_cols)} ({', '.join(numeric_cols[:5])})",
+            f"📝 Text columns: {len(text_cols)} ({', '.join(text_cols[:5])})",
+            "",
+            f"User request: '{message or user_message or query}'",
         ]
-        
-        # Add sample data preview
-        if n_rows > 0:
-            summary_lines.append("📋 First few rows:")
-            try:
-                preview = df.head(3).to_string(max_cols=6, max_colwidth=20)
-                summary_lines.extend(['  ' + line for line in preview.split('\n')])
-            except:
-                summary_lines.append("  (Preview unavailable)")
-        
-        results = [TextContent(type="text", text="\n".join(summary_lines))]
-        
-        # AUTO-GENERATE CHARTS
+
+        # Add preview
+        try:
+            preview = df.head(3).to_string(max_cols=6, max_colwidth=20)
+            summary.append("\n📋 First few rows:\n" + preview)
+        except:
+            summary.append("\n(Preview unavailable)")
+
+        results = [TextContent(type="text", text="\n".join(summary))]
+
+        # Charts
         charts_made = 0
         max_charts = 3
-        
-        # Chart 1: Line chart (since user often requests this)
+
+        # Line chart
         if numeric_cols and charts_made < max_charts:
             try:
                 fig, ax = plt.subplots(figsize=(12, 6))
-                
-                # If there's a date-like column, use it as x-axis
-                date_col = None
-                for col in df.columns:
-                    if any(word in col.lower() for word in ['date', 'time', 'year', 'month', 'day']):
-                        date_col = col
-                        break
-                
+                date_col = next((col for col in df.columns if any(w in col.lower() for w in ['date', 'time', 'year', 'month'])), None)
                 if date_col and date_col not in numeric_cols:
-                    # Plot numeric columns against date column
-                    for i, num_col in enumerate(numeric_cols[:3]):  # Max 3 lines
-                        ax.plot(df[date_col], df[num_col], marker='o', label=num_col, linewidth=2)
+                    for num_col in numeric_cols[:3]:
+                        ax.plot(df[date_col], df[num_col], marker='o', label=num_col)
                     ax.set_xlabel(date_col)
-                    ax.legend()
-                    ax.set_title(f'Line Chart: {", ".join(numeric_cols[:3])} over {date_col}')
                 else:
-                    # Just plot numeric columns against index
-                    for i, num_col in enumerate(numeric_cols[:3]):
-                        ax.plot(df.index, df[num_col], marker='o', label=num_col, linewidth=2)
-                    ax.set_xlabel('Row Index')
-                    ax.legend()
-                    ax.set_title(f'Line Chart: {", ".join(numeric_cols[:3])}')
-                
-                ax.grid(True, alpha=0.3)
+                    for num_col in numeric_cols[:3]:
+                        ax.plot(df.index, df[num_col], marker='o', label=num_col)
+                    ax.set_xlabel("Index")
+                ax.legend()
+                ax.set_title("Line Chart")
                 plt.xticks(rotation=45)
-                plt.tight_layout()
-                
                 results.append(ImageContent(type="image", mimeType="image/png", data=_render_figure_to_base64(fig)))
                 charts_made += 1
             except Exception as e:
                 print(f"Line chart failed: {e}")
-        
-        # Chart 2: Bar chart if we have categorical data
+
+        # Bar chart
         if text_cols and numeric_cols and charts_made < max_charts:
             try:
-                cat_col = text_cols[0]
-                num_col = numeric_cols[0]
-                
-                # Group and get top categories
-                grouped = df.groupby(cat_col)[num_col].mean().sort_values(ascending=False).head(10)
-                
+                grouped = df.groupby(text_cols[0])[numeric_cols[0]].mean().sort_values(ascending=False).head(10)
                 fig, ax = plt.subplots(figsize=(12, 6))
                 grouped.plot(kind='bar', ax=ax, color='skyblue')
-                ax.set_title(f'Bar Chart: Average {num_col} by {cat_col}')
-                ax.set_xlabel(cat_col)
-                ax.set_ylabel(f'Average {num_col}')
-                plt.xticks(rotation=45, ha='right')
-                plt.tight_layout()
-                
+                ax.set_title(f"{numeric_cols[0]} by {text_cols[0]}")
+                plt.xticks(rotation=45)
                 results.append(ImageContent(type="image", mimeType="image/png", data=_render_figure_to_base64(fig)))
                 charts_made += 1
             except Exception as e:
                 print(f"Bar chart failed: {e}")
-        
-        # Chart 3: Distribution histogram
+
+        # Histogram
         if numeric_cols and charts_made < max_charts:
             try:
-                col = numeric_cols[0]
                 fig, ax = plt.subplots(figsize=(10, 6))
-                
-                df[col].hist(bins=20, alpha=0.7, ax=ax, color='lightgreen', edgecolor='black')
-                ax.set_title(f'Distribution of {col}')
-                ax.set_xlabel(col)
-                ax.set_ylabel('Frequency')
-                ax.grid(True, alpha=0.3)
-                plt.tight_layout()
-                
+                df[numeric_cols[0]].hist(bins=20, ax=ax, color='lightgreen', edgecolor='black')
+                ax.set_title(f"Distribution of {numeric_cols[0]}")
                 results.append(ImageContent(type="image", mimeType="image/png", data=_render_figure_to_base64(fig)))
                 charts_made += 1
             except Exception as e:
                 print(f"Histogram failed: {e}")
-        
-        # Update summary with chart info
-        chart_summary = f"\n\n🎨 Generated {charts_made} charts based on your data!"
-        if "line" in user_request.lower():
-            chart_summary += " (Including the requested line chart)"
-        
-        results[0] = TextContent(type="text", text=results[0].text + chart_summary)
-        
-        return results
-        
-    except Exception as e:
-        return [TextContent(type="text", text=f"❌ Analysis failed: {str(e)}\n\nThis helps debug the issue. Please share this error with support.")]
 
+        return results
+
+    except Exception as e:
+        return [TextContent(type="text", text=f"❌ Analysis failed: {str(e)}")]
 # ------------------------------------------------------------------
 # Simple debugging tool (fixed - no **kwargs)
 # ------------------------------------------------------------------
