@@ -196,297 +196,221 @@ async def job_finder(
 # ANALYZE DATA FILE: accepts base64 file_data OR file_url pointing to csv/xlsx
 # ------------------------------------------------------------------
 ANALYZE_DATA_DESCRIPTION = RichToolDescription(
-    description="Accept CSV/XLSX (base64 or URL), run analytics, and return summary + PNG images (base64).",
-    use_when="User uploads a spreadsheet and asks for charts or analysis.",
-    side_effects="Reads file, processes it, and returns text + images."
+    description="Analyze CSV/Excel files and create charts. Just provide the file data and optionally describe what you want to see.",
+    use_when="User uploads a data file (CSV/Excel) and wants analysis or charts.",
+    side_effects="Returns data summary and automatically generated charts as images."
 )
-
-def _detect_intents_and_targets(user_request: str, df: pd.DataFrame) -> dict:
-    req = (user_request or "").lower()
-    chart_types = []
-    for k, v in (("bar", "bar"), ("line", "line"), ("scatter", "scatter"), ("hist", "hist"), ("heatmap", "heatmap")):
-        if k in req:
-            chart_types.append(v)
-    if not chart_types:
-        chart_types = ["line"]
-    agg = None
-    for w in ("sum", "total", "average", "avg", "mean", "count"):
-        if w in req:
-            agg = "mean" if w in ("average", "avg", "mean") else ("count" if w == "count" else "sum")
-            break
-    top_n = None
-    m = re.search(r"top\s+(\d+)", req)
-    if m:
-        top_n = int(m.group(1))
-    mentioned = []
-    for col in df.columns:
-        if re.search(rf"\b{re.escape(col.lower())}\b", req):
-            mentioned.append(col)
-    group_by = None
-    metric = None
-    m2 = re.search(r"by\s+([a-z0-9_ ]+)", req)
-    if m2:
-        candidate = m2.group(1).strip()
-        for col in df.columns:
-            if candidate in col.lower():
-                group_by = col
-                break
-    if mentioned:
-        if len(mentioned) >= 2:
-            group_by, metric = mentioned[0], mentioned[1]
-        elif len(mentioned) == 1:
-            c = mentioned[0]
-            if pd.api.types.is_numeric_dtype(df[c]):
-                metric = c
-                for cc in df.columns:
-                    if not pd.api.types.is_numeric_dtype(df[cc]):
-                        group_by = cc
-                        break
-            else:
-                group_by = c
-                for cc in df.columns:
-                    if pd.api.types.is_numeric_dtype(df[cc]):
-                        metric = cc
-                        break
-    numeric_cols = df.select_dtypes(include="number").columns.tolist()
-    object_cols = df.select_dtypes(include="object").columns.tolist()
-    if metric is None and numeric_cols:
-        metric = numeric_cols[0]
-    if group_by is None and object_cols:
-        group_by = object_cols[0] if object_cols else None
-    return {"chart_types": chart_types, "agg": agg, "top_n": top_n, "group_by": group_by, "metric": metric}
-
-def _render_figure_to_base64(fig: matplotlib.figure.Figure) -> str:
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight")
-    plt.close(fig)
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
-
-# Chart helper functions (use seaborn where helpful)
-def _make_bar_chart(df: pd.DataFrame, x: str, y: str, title: str) -> str:
-    fig, ax = plt.subplots(figsize=(8, 5))
-    sns.barplot(data=df, x=x, y=y, ax=ax)
-    ax.set_title(title)
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    return _render_figure_to_base64(fig)
-
-def _make_line_chart(df: pd.DataFrame, x: str, y: str, title: str) -> str:
-    fig, ax = plt.subplots(figsize=(8, 5))
-    sns.lineplot(data=df, x=x, y=y, ax=ax)
-    ax.set_title(title)
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    return _render_figure_to_base64(fig)
-
-def _make_scatter(df: pd.DataFrame, x: str, y: str, title: str) -> str:
-    fig, ax = plt.subplots(figsize=(8, 5))
-    sns.scatterplot(data=df, x=x, y=y, ax=ax)
-    ax.set_title(title)
-    plt.tight_layout()
-    return _render_figure_to_base64(fig)
-
-def _make_hist(df: pd.DataFrame, columns: List[str], title: str) -> str:
-    fig, ax = plt.subplots(figsize=(8, 5))
-    df[columns].hist(ax=ax)
-    fig.suptitle(title)
-    plt.tight_layout()
-    return _render_figure_to_base64(fig)
-
-def _make_heatmap_correlation(df: pd.DataFrame, title: str) -> str:
-    corr = df.corr()
-    fig, ax = plt.subplots(figsize=(8, 6))
-    sns.heatmap(corr, annot=False, ax=ax)
-    ax.set_title(title)
-    plt.tight_layout()
-    return _render_figure_to_base64(fig)
 
 @mcp.tool(description=ANALYZE_DATA_DESCRIPTION.model_dump_json())
 async def analyze_data_file(
-    file_data: Annotated[str, Field(description="Base64-encoded CSV or XLSX file data")] = None,
-    file_type: Annotated[str, Field(description="csv or xlsx")] = "csv",
-    file_url: Annotated[str | None, Field(description="Optional: public URL to download the file")] = None,
-    user_request: Annotated[str, Field(description="Natural language analysis request")] = "",
-    sheet_name: Annotated[str | None, Field(description="Optional sheet name for xlsx")] = None,
-    max_charts: Annotated[int, Field(description="Max charts to return")] = 3,
+    file_data: Annotated[str, Field(description="Base64-encoded file data from user upload")],
+    analysis_request: Annotated[str, Field(description="What the user wants to analyze or see (optional)")] = "general overview",
+    file_type: Annotated[str, Field(description="File format: 'csv' or 'xlsx'")] = "csv"
 ) -> List[TextContent | ImageContent]:
+    """
+    Simplified data analysis tool that's easier for AI assistants to use.
+    Automatically detects what charts to make based on the data structure.
+    """
     try:
-        # obtain bytes: either from base64 payload or by fetching URL
-        if file_url:
-            # allow remote fetch (S3, presigned URL); supports csv/xlsx
-            raw_text, _ = await Fetch.fetch_url(file_url)
-            # If it's a CSV text, convert to bytes
-            file_bytes = raw_text.encode("utf-8")
-            # try to infer file_type if not supplied
-            if not file_type:
-                if file_url.lower().endswith(".xlsx") or "sheet" in file_url.lower():
-                    file_type = "xlsx"
-                elif file_url.lower().endswith(".csv"):
-                    file_type = "csv"
-        elif file_data:
-            try:
-                file_bytes = base64.b64decode(file_data)
-            except Exception:
-                raise McpError(ErrorData(code=INVALID_PARAMS, message="file_data is not valid base64"))
-        else:
-            raise McpError(ErrorData(code=INVALID_PARAMS, message="Provide file_data (base64) or file_url"))
+        # Decode the file data
+        try:
+            file_bytes = base64.b64decode(file_data)
+        except Exception:
+            raise McpError(ErrorData(code=INVALID_PARAMS, message="Invalid base64 file data"))
 
         buf = io.BytesIO(file_bytes)
 
-        # load dataframe
+        # Load dataframe with better error handling
+        df = None
         if file_type.lower() == "csv":
-            # try with utf-8, fallback to latin1; infer sep if needed
-            try:
-                df = pd.read_csv(buf)
-            except Exception:
-                buf.seek(0)
-                try:
-                    df = pd.read_csv(buf, encoding="latin1")
-                except Exception:
-                    buf.seek(0)
-                    # try sniffing delimiter
-                    sample = buf.read(4096).decode(errors="ignore")
-                    sep = "," if sample.count(",") >= sample.count("\t") else "\t"
-                    buf.seek(0)
-                    df = pd.read_csv(buf, sep=sep, engine="python")
+            # Try multiple approaches for CSV loading
+            encodings = ['utf-8', 'latin1', 'iso-8859-1']
+            separators = [',', ';', '\t']
+            
+            for encoding in encodings:
+                for sep in separators:
+                    try:
+                        buf.seek(0)
+                        df = pd.read_csv(buf, encoding=encoding, sep=sep)
+                        if len(df.columns) > 1:  # Success if we got multiple columns
+                            break
+                    except:
+                        continue
+                if df is not None and len(df.columns) > 1:
+                    break
+                    
         elif file_type.lower() == "xlsx":
             try:
-                import openpyxl  # ensure driver exists
                 buf.seek(0)
-                df = pd.read_excel(buf, sheet_name=sheet_name) if sheet_name else pd.read_excel(buf)
-                if isinstance(df, dict):
-                    # multiple sheets returned -> pick first
-                    df = list(df.values())[0]
+                df = pd.read_excel(buf)
             except Exception as e:
-                raise McpError(ErrorData(code=INVALID_PARAMS, message=f"Failed to read xlsx: {e}"))
-        else:
-            raise McpError(ErrorData(code=INVALID_PARAMS, message="Unsupported file type; use 'csv' or 'xlsx'"))
-
+                raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to read Excel file: {str(e)}"))
+        
         if df is None or df.empty:
-            raise McpError(ErrorData(code=INVALID_PARAMS, message="Uploaded file contained no data"))
+            raise McpError(ErrorData(code=INVALID_PARAMS, message="Could not load data from file or file is empty"))
 
-        # derive basic metadata
+        # Clean up column names (remove extra spaces, etc.)
+        df.columns = df.columns.astype(str).str.strip()
+        
+        # Basic info about the dataset
         n_rows, n_cols = df.shape
-        columns = df.columns.tolist()
-        numeric_cols = df.select_dtypes(include="number").columns.tolist()
-        object_cols = df.select_dtypes(include="object").columns.tolist()
-
-        parsed = _detect_intents_and_targets(user_request or "", df)
-        chart_types = parsed["chart_types"]
-        agg = parsed["agg"]
-        top_n = parsed["top_n"]
-        group_by = parsed["group_by"]
-        metric = parsed["metric"]
-
-        # build summary text
-        summary_lines = [
-            f"Rows: {n_rows}, Columns: {n_cols}",
-            f"Columns: {', '.join(columns)}",
-            f"Numeric columns: {', '.join(numeric_cols) if numeric_cols else 'None'}",
-            f"Detected chart types: {', '.join(chart_types)}",
-            f"Detected aggregation: {agg or 'none'}",
-            f"Group by: {group_by or 'none'}, Metric: {metric or 'none'}",
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        text_cols = df.select_dtypes(include=['object']).columns.tolist()
+        
+        # Build summary
+        summary_parts = [
+            f"📊 Data Analysis Results",
+            f"",
+            f"Dataset Overview:",
+            f"• Rows: {n_rows:,}",
+            f"• Columns: {n_cols}",
+            f"• Numeric columns: {len(numeric_cols)}",
+            f"• Text columns: {len(text_cols)}",
+            f"",
+            f"Column Names: {', '.join(df.columns.tolist()[:10])}{'...' if len(df.columns) > 10 else ''}",
+            f""
         ]
+        
+        # Add basic statistics for numeric columns
+        if numeric_cols:
+            summary_parts.append("Key Statistics:")
+            for col in numeric_cols[:5]:  # Show stats for first 5 numeric columns
+                try:
+                    mean_val = df[col].mean()
+                    summary_parts.append(f"• {col}: avg={mean_val:.2f}, min={df[col].min():.2f}, max={df[col].max():.2f}")
+                except:
+                    pass
+        
+        results = [TextContent(type="text", text="\n".join(summary_parts))]
+        
+        # AUTO-GENERATE USEFUL CHARTS
+        charts_created = 0
+        max_charts = 4
 
-        chart_images: List[Tuple[str, str]] = []
-        charts_generated = 0
-
-        # Aggregation path
-        if agg and group_by and metric:
+        def _render_figure_to_base64(fig):
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", bbox_inches="tight")
+            plt.close(fig)
+            buf.seek(0)
+            return base64.b64encode(buf.read()).decode("utf-8")
+        
+        # Chart 1: If we have numeric data, create a correlation heatmap
+        if len(numeric_cols) >= 2 and charts_created < max_charts:
             try:
-                if agg == "count":
-                    agg_df = df.groupby(group_by).size().reset_index(name="count").sort_values("count", ascending=False)
-                    metric_col = "count"
-                else:
-                    agg_df = getattr(df.groupby(group_by)[metric], agg)().reset_index()
-                    metric_col = metric
-                    agg_df = agg_df.sort_values(metric_col, ascending=False)
-                if top_n:
-                    agg_df = agg_df.head(top_n)
-                title = f"{agg.title()} of {metric_col} by {group_by}"
-                chart_images.append((title, _make_bar_chart(agg_df, group_by, metric_col, title)))
-                charts_generated += 1
-                summary_lines.append(f"Aggregated rows: {len(agg_df)} (top_n={top_n})")
-            except Exception:
-                # if aggregation fails, continue to other charts
-                pass
-
-        # other chart generation
-        for ctype in chart_types:
-            if charts_generated >= max_charts:
-                break
-            if ctype == "heatmap":
-                if len(numeric_cols) >= 2:
-                    chart_images.append(("Correlation heatmap", _make_heatmap_correlation(df[numeric_cols], "Correlation heatmap")))
-                    charts_generated += 1
-            elif ctype == "hist":
-                cols = (numeric_cols[:4] or columns[:4])
-                chart_images.append((f"Histogram of {', '.join(cols)}", _make_hist(df, cols, f"Histogram of {', '.join(cols)}")))
-                charts_generated += 1
-            elif ctype == "scatter":
-                if metric and pd.api.types.is_numeric_dtype(df[metric]):
-                    x_col = next((c for c in numeric_cols if c != metric), None)
-                    if x_col:
-                        chart_images.append((f"Scatter: {x_col} vs {metric}", _make_scatter(df, x_col, metric, f"Scatter: {x_col} vs {metric}")))
-                        charts_generated += 1
-                elif len(numeric_cols) >= 2:
-                    chart_images.append((f"Scatter: {numeric_cols[0]} vs {numeric_cols[1]}", _make_scatter(df, numeric_cols[0], numeric_cols[1], f"Scatter: {numeric_cols[0]} vs {numeric_cols[1]}")))
-                    charts_generated += 1
-            elif ctype == "line":
-                if numeric_cols:
-                    y = numeric_cols[0]
-                    x = (object_cols[0] if object_cols else None)
-                    if x:
-                        try:
-                            chart_images.append((f"Line: {y} by {x}", _make_line_chart(df, x, y, f"Line: {y} by {x}")))
-                            charts_generated += 1
-                        except Exception:
-                            fig, ax = plt.subplots(figsize=(8, 5)); df[y].plot(ax=ax); ax.set_title(f"Line: {y}"); plt.tight_layout()
-                            chart_images.append((f"Line: {y}", _render_figure_to_base64(fig))); charts_generated += 1
-                    else:
-                        fig, ax = plt.subplots(figsize=(8, 5)); df[y].plot(ax=ax); ax.set_title(f"Line: {y}"); plt.tight_layout()
-                        chart_images.append((f"Line: {y}", _render_figure_to_base64(fig))); charts_generated += 1
-            elif ctype == "bar":
-                if group_by and metric:
-                    bar_df = df.groupby(group_by)[metric].sum().reset_index().sort_values(metric, ascending=False)
-                    if top_n:
-                        bar_df = bar_df.head(top_n)
-                    chart_images.append((f"Sum of {metric} by {group_by}", _make_bar_chart(bar_df, group_by, metric, f"Sum of {metric} by {group_by}")))
-                    charts_generated += 1
-                elif numeric_cols:
-                    fig, ax = plt.subplots(figsize=(8, 5)); df[numeric_cols[0]].plot(kind="bar", ax=ax); ax.set_title(f"Bar: {numeric_cols[0]}"); plt.tight_layout()
-                    chart_images.append((f"Bar: {numeric_cols[0]}", _render_figure_to_base64(fig))); charts_generated += 1
-
-        # fallback charts
-        if charts_generated == 0:
-            if len(numeric_cols) >= 2:
-                chart_images.append((f"Scatter: {numeric_cols[0]} vs {numeric_cols[1]}", _make_scatter(df, numeric_cols[0], numeric_cols[1], f"Scatter: {numeric_cols[0]} vs {numeric_cols[1]}")))
-            elif numeric_cols:
-                fig, ax = plt.subplots(figsize=(8, 5)); df[numeric_cols[0]].plot(ax=ax); ax.set_title(f"Line: {numeric_cols[0]}"); plt.tight_layout()
-                chart_images.append((f"Line: {numeric_cols[0]}", _render_figure_to_base64(fig)))
-            else:
-                summary_lines.append("No numeric columns available to plot.")
-
-        # statistical summary (short)
-        try:
-            stats = df.describe(include="all").head(12).to_string()
-            summary_lines.append("\nStatistical summary (first lines):")
-            summary_lines.extend(stats.splitlines()[:12])
-        except Exception:
-            pass
-
-        # build results
-        results: List[TextContent | ImageContent] = []
-        results.append(TextContent(type="text", text="\n".join(summary_lines)))
-        for title, b64 in chart_images[:max_charts]:
-            results.append(ImageContent(type="image", mimeType="image/png", data=b64))
-
+                fig, ax = plt.subplots(figsize=(10, 8))
+                corr_matrix = df[numeric_cols].corr()
+                sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', center=0, 
+                           square=True, fmt='.2f', ax=ax)
+                ax.set_title('Correlation Between Numeric Variables')
+                plt.tight_layout()
+                
+                chart_b64 = _render_figure_to_base64(fig)
+                results.append(ImageContent(type="image", mimeType="image/png", data=chart_b64))
+                charts_created += 1
+            except Exception as e:
+                print(f"Failed to create correlation heatmap: {e}")
+        
+        # Chart 2: Distribution of first numeric column
+        if numeric_cols and charts_created < max_charts:
+            try:
+                col = numeric_cols[0]
+                fig, ax = plt.subplots(figsize=(10, 6))
+                
+                # Create histogram with better styling
+                df[col].hist(bins=30, alpha=0.7, ax=ax, color='skyblue', edgecolor='black')
+                ax.set_title(f'Distribution of {col}')
+                ax.set_xlabel(col)
+                ax.set_ylabel('Frequency')
+                ax.grid(True, alpha=0.3)
+                plt.tight_layout()
+                
+                chart_b64 = _render_figure_to_base64(fig)
+                results.append(ImageContent(type="image", mimeType="image/png", data=chart_b64))
+                charts_created += 1
+            except Exception as e:
+                print(f"Failed to create histogram: {e}")
+        
+        # Chart 3: If we have categorical + numeric, create a bar chart
+        if text_cols and numeric_cols and charts_created < max_charts:
+            try:
+                cat_col = text_cols[0]
+                num_col = numeric_cols[0]
+                
+                # Group by categorical and average the numeric
+                grouped = df.groupby(cat_col)[num_col].mean().sort_values(ascending=False)
+                
+                # Limit to top 15 categories for readability
+                if len(grouped) > 15:
+                    grouped = grouped.head(15)
+                
+                fig, ax = plt.subplots(figsize=(12, 6))
+                grouped.plot(kind='bar', ax=ax, color='lightcoral')
+                ax.set_title(f'Average {num_col} by {cat_col}')
+                ax.set_xlabel(cat_col)
+                ax.set_ylabel(f'Average {num_col}')
+                plt.xticks(rotation=45, ha='right')
+                plt.tight_layout()
+                
+                chart_b64 = _render_figure_to_base64(fig)
+                results.append(ImageContent(type="image", mimeType="image/png", data=chart_b64))
+                charts_created += 1
+            except Exception as e:
+                print(f"Failed to create bar chart: {e}")
+        
+        # Chart 4: If we have 2+ numeric columns, create a scatter plot
+        if len(numeric_cols) >= 2 and charts_created < max_charts:
+            try:
+                x_col, y_col = numeric_cols[0], numeric_cols[1]
+                
+                fig, ax = plt.subplots(figsize=(10, 6))
+                ax.scatter(df[x_col], df[y_col], alpha=0.6, color='green')
+                ax.set_title(f'{y_col} vs {x_col}')
+                ax.set_xlabel(x_col)
+                ax.set_ylabel(y_col)
+                ax.grid(True, alpha=0.3)
+                plt.tight_layout()
+                
+                chart_b64 = _render_figure_to_base64(fig)
+                results.append(ImageContent(type="image", mimeType="image/png", data=chart_b64))
+                charts_created += 1
+            except Exception as e:
+                print(f"Failed to create scatter plot: {e}")
+        
+        # Add summary of what was created
+        final_summary = f"\n✅ Generated {charts_created} charts automatically based on your data structure."
+        if charts_created == 0:
+            final_summary = "\n⚠️ No charts could be generated - this might be a text-only dataset."
+        
+        results[0] = TextContent(type="text", text=results[0].text + final_summary)
+        
         return results
 
     except McpError:
         raise
     except Exception as e:
-        raise McpError(ErrorData(code=INTERNAL_ERROR, message=str(e)))
+        error_msg = f"Analysis failed: {str(e)}"
+        return [TextContent(type="text", text=error_msg)]
+    
+@mcp.tool
+async def debug_data_upload(
+    file_data: Annotated[str, Field(description="Base64 file data to inspect")]
+) -> str:
+    """Simple tool to check if file upload is working correctly"""
+    try:
+        decoded = base64.b64decode(file_data)
+        size_kb = len(decoded) / 1024
+        
+        # Try to detect file type
+        if decoded.startswith(b'PK'):
+            file_type = "Excel/ZIP file"
+        elif b',' in decoded[:1000] or b';' in decoded[:1000]:
+            file_type = "Likely CSV"
+        else:
+            file_type = "Unknown format"
+            
+        return f"✅ File received successfully!\nSize: {size_kb:.1f} KB\nDetected type: {file_type}\nFirst 100 bytes: {decoded[:100]}"
+    except Exception as e:
+        return f"❌ File upload failed: {str(e)}"
 
 # ------------------------------------------------------------------
 # Health route for quick checks (optional: used by Render or manual)
