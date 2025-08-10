@@ -369,6 +369,249 @@ async def analyze_data_file(
 
     except Exception as e:
         return [TextContent(type="text", text=f"❌ Analysis failed: {str(e)}")]
+    
+# ------------------------------------------------------------------
+# Simple Plain Text Sentiment Analysis Tool
+# ------------------------------------------------------------------
+SENTIMENT_ANALYSIS_DESCRIPTION = RichToolDescription(
+    description="Analyze sentiment of reviews or text entered as plain text. Supports single reviews or multiple reviews separated by newlines.",
+    use_when="Use when user types or pastes reviews/text for sentiment analysis.",
+    side_effects="Returns sentiment scores and visual analysis."
+)
+
+@mcp.tool(description=SENTIMENT_ANALYSIS_DESCRIPTION.model_dump_json())
+async def analyze_text_sentiment(
+    text: Annotated[str, Field(description="Plain text reviews or content to analyze")] = None,
+    content: Annotated[str, Field(description="Alternative text content parameter")] = None,
+    message: Annotated[str, Field(description="User message containing text to analyze")] = None,
+    reviews: Annotated[str, Field(description="Reviews text to analyze")] = None,
+) -> List[TextContent | ImageContent]:
+    """
+    Analyze sentiment of plain text reviews. Automatically detects single vs multiple reviews.
+    """
+    
+    # Get the actual text to analyze from any parameter
+    actual_text = text or content or message or reviews
+    if not actual_text or len(actual_text.strip()) < 5:
+        return [TextContent(type="text", text="❌ Please provide text or reviews to analyze.")]
+    
+    try:
+        # Clean and prepare the text
+        actual_text = actual_text.strip()
+        
+        # Check if it's multiple reviews (contains newlines or common separators)
+        potential_reviews = []
+        
+        # Try different separators
+        for separator in ['\n', '||', '---', '###']:
+            if separator in actual_text:
+                potential_reviews = [r.strip() for r in actual_text.split(separator) if r.strip()]
+                break
+        
+        # If no separators found, treat as single text but check for sentence breaks
+        if not potential_reviews:
+            # Look for review-like patterns (sentences ending with periods followed by capitals)
+            import re
+            sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', actual_text)
+            if len(sentences) > 1 and any(len(s.split()) > 10 for s in sentences):
+                potential_reviews = [s.strip() for s in sentences if len(s.strip()) > 10]
+            else:
+                potential_reviews = [actual_text]
+        
+        # Analyze each review/text segment
+        results_data = []
+        total_polarity = 0
+        total_subjectivity = 0
+        
+        for i, review_text in enumerate(potential_reviews[:50], 1):  # Limit to 50 reviews
+            if len(review_text) < 5:
+                continue
+                
+            blob = TextBlob(review_text)
+            polarity = blob.sentiment.polarity
+            subjectivity = blob.sentiment.subjectivity
+            
+            # Classify sentiment
+            if polarity > 0.1:
+                sentiment_label = "Positive 😊"
+                emoji = "😊"
+            elif polarity < -0.1:
+                sentiment_label = "Negative 😔"
+                emoji = "😔"
+            else:
+                sentiment_label = "Neutral 😐"
+                emoji = "😐"
+            
+            results_data.append({
+                'index': i,
+                'text': review_text[:100] + ('...' if len(review_text) > 100 else ''),
+                'full_text': review_text,
+                'polarity': polarity,
+                'subjectivity': subjectivity,
+                'sentiment': sentiment_label,
+                'emoji': emoji
+            })
+            
+            total_polarity += polarity
+            total_subjectivity += subjectivity
+        
+        if not results_data:
+            return [TextContent(type="text", text="❌ No valid text found to analyze.")]
+        
+        # Calculate overall statistics
+        avg_polarity = total_polarity / len(results_data)
+        avg_subjectivity = total_subjectivity / len(results_data)
+        
+        positive_count = sum(1 for r in results_data if r['polarity'] > 0.1)
+        negative_count = sum(1 for r in results_data if r['polarity'] < -0.1)
+        neutral_count = len(results_data) - positive_count - negative_count
+        
+        # Determine overall sentiment
+        if avg_polarity > 0.1:
+            overall_sentiment = "Positive 😊"
+        elif avg_polarity < -0.1:
+            overall_sentiment = "Negative 😔"
+        else:
+            overall_sentiment = "Neutral 😐"
+        
+        # Build results text
+        if len(results_data) == 1:
+            # Single review analysis
+            result = results_data[0]
+            analysis_text = [
+                "🎭 **Sentiment Analysis Results**",
+                "",
+                f"📝 **Text:** {result['full_text'][:200]}{'...' if len(result['full_text']) > 200 else ''}",
+                "",
+                f"📊 **Sentiment:** {result['sentiment']}",
+                f"📈 **Polarity Score:** {result['polarity']:.3f} (-1=Negative, +1=Positive)",
+                f"📝 **Subjectivity:** {result['subjectivity']:.3f} (0=Objective, 1=Subjective)",
+                f"🎯 **Confidence:** {min(abs(result['polarity']) * 100, 100):.1f}%",
+            ]
+        else:
+            # Multiple reviews analysis
+            analysis_text = [
+                f"🎭 **Sentiment Analysis - {len(results_data)} Reviews**",
+                "",
+                f"📊 **Overall Sentiment:** {overall_sentiment}",
+                f"📈 **Average Polarity:** {avg_polarity:.3f}",
+                f"📝 **Average Subjectivity:** {avg_subjectivity:.3f}",
+                "",
+                f"😊 **Positive Reviews:** {positive_count} ({positive_count/len(results_data)*100:.1f}%)",
+                f"😐 **Neutral Reviews:** {neutral_count} ({neutral_count/len(results_data)*100:.1f}%)",
+                f"😔 **Negative Reviews:** {negative_count} ({negative_count/len(results_data)*100:.1f}%)",
+                "",
+                "📋 **Individual Reviews:**"
+            ]
+            
+            # Add individual review results (first 10)
+            for result in results_data[:10]:
+                analysis_text.append(f"{result['emoji']} **{result['index']}.** [{result['polarity']:.2f}] {result['text']}")
+            
+            if len(results_data) > 10:
+                analysis_text.append(f"... and {len(results_data) - 10} more reviews")
+        
+        results = [TextContent(type="text", text="\n".join(analysis_text))]
+        
+        # Create visualization
+        try:
+            if len(results_data) == 1:
+                # Single review visualization
+                fig, ((ax1, ax2)) = plt.subplots(1, 2, figsize=(12, 5))
+                fig.suptitle('Sentiment Analysis', fontsize=14, fontweight='bold')
+                
+                result = results_data[0]
+                
+                # Sentiment gauge
+                colors = ['red' if result['polarity'] < 0 else 'yellow' if result['polarity'] == 0 else 'green']
+                ax1.pie([abs(result['polarity']), 1-abs(result['polarity'])], 
+                       colors=[colors[0], 'lightgray'],
+                       startangle=90)
+                ax1.set_title(f'{result["sentiment"]}\nScore: {result["polarity"]:.3f}')
+                
+                # Metrics bar chart
+                metrics = ['Polarity', 'Subjectivity']
+                values = [result['polarity'], result['subjectivity']]
+                colors_bar = ['blue', 'orange']
+                
+                bars = ax2.bar(metrics, values, color=colors_bar, alpha=0.7)
+                ax2.set_ylim(-1, 1)
+                ax2.set_title('Sentiment Metrics')
+                ax2.grid(True, alpha=0.3)
+                
+                # Add value labels
+                for bar, value in zip(bars, values):
+                    height = bar.get_height()
+                    ax2.text(bar.get_x() + bar.get_width()/2., height + 0.05 if height >= 0 else height - 0.05,
+                           f'{value:.3f}', ha='center', va='bottom' if height >= 0 else 'top')
+                
+            else:
+                # Multiple reviews visualization
+                fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(14, 10))
+                fig.suptitle(f'Sentiment Analysis - {len(results_data)} Reviews', fontsize=14)
+                
+                # 1. Sentiment distribution
+                sizes = [positive_count, neutral_count, negative_count]
+                labels = ['Positive', 'Neutral', 'Negative']
+                colors = ['green', 'gray', 'red']
+                
+                ax1.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
+                ax1.set_title('Sentiment Distribution')
+                
+                # 2. Polarity histogram
+                polarities = [r['polarity'] for r in results_data]
+                ax2.hist(polarities, bins=min(20, len(results_data)), color='blue', alpha=0.7, edgecolor='black')
+                ax2.set_xlabel('Polarity Score')
+                ax2.set_ylabel('Number of Reviews')
+                ax2.set_title('Polarity Distribution')
+                ax2.axvline(x=avg_polarity, color='red', linestyle='--', label=f'Average: {avg_polarity:.3f}')
+                ax2.legend()
+                
+                # 3. Review index vs polarity
+                indices = [r['index'] for r in results_data]
+                ax3.plot(indices, polarities, 'o-', color='blue', alpha=0.7)
+                ax3.set_xlabel('Review Number')
+                ax3.set_ylabel('Polarity Score')
+                ax3.set_title('Sentiment Trend')
+                ax3.grid(True, alpha=0.3)
+                ax3.axhline(y=0, color='gray', linestyle='-', alpha=0.5)
+                
+                # 4. Summary statistics
+                stats_text = f"""
+Reviews Analyzed: {len(results_data)}
+
+Average Scores:
+• Polarity: {avg_polarity:.3f}
+• Subjectivity: {avg_subjectivity:.3f}
+
+Distribution:
+• Positive: {positive_count} ({positive_count/len(results_data)*100:.1f}%)
+• Neutral: {neutral_count} ({neutral_count/len(results_data)*100:.1f}%)
+• Negative: {negative_count} ({negative_count/len(results_data)*100:.1f}%)
+
+Overall: {overall_sentiment}
+                """.strip()
+                
+                ax4.text(0.05, 0.95, stats_text, transform=ax4.transAxes, 
+                        verticalalignment='top', fontfamily='monospace', fontsize=10)
+                ax4.set_xlim(0, 1)
+                ax4.set_ylim(0, 1)
+                ax4.axis('off')
+                ax4.set_title('Summary Statistics')
+            
+            plt.tight_layout()
+            results.append(ImageContent(type="image", mimeType="image/png", 
+                                      data=_render_figure_to_base64(fig)))
+            
+        except Exception as chart_error:
+            results.append(TextContent(type="text", 
+                                     text=f"⚠️ Chart generation failed: {str(chart_error)}"))
+        
+        return results
+        
+    except Exception as e:
+        return [TextContent(type="text", text=f"❌ Sentiment analysis failed: {str(e)}")]
+
 # ------------------------------------------------------------------
 # Simple debugging tool (fixed - no **kwargs)
 # ------------------------------------------------------------------
