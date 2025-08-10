@@ -882,7 +882,7 @@ async def debug_whatsapp_upload(
 async def main():
     print(f"🚀 Starting MCP server on 0.0.0.0:{PORT}")
     # FastMCP internal transport name kept as "streamable-http" (works for demo)
-    await mcp.run_async("streamable-http", host="0.0.0.0", port=8086)
+    await mcp.run_async("streamable-http", host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
     asyncio.run(main())
