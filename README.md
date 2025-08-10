@@ -16,6 +16,9 @@ MCP (Model Context Protocol) allows AI assistants like Puch to connect to extern
 ### 🖼️ Image Processing Tool
 - **Convert images to black & white** - Upload any image and get a monochrome version
 
+### Data analytics
+- **Perform basic analytics"" - Data can be given as plain text csv, and what to perform on it, barring graphs or images
+
 ### 🔐 Built-in Authentication
 - Bearer token authentication (required by Puch AI)
 - Validation tool that returns your phone number
